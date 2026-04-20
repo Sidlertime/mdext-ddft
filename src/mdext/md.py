@@ -61,6 +61,7 @@ class MD:
         self,
         *,
         setup: Callable[[PyLammps, int], None],
+        integrator: str = "nve",
         T: float,
         P: Optional[float],
         seed: int,
@@ -169,7 +170,15 @@ class MD:
         self.T = T
         self.P = P
         if P is None:
-            lmp.fix(f"Ensemble all nvt temp {T} {T} {Tdamp}")
+            if integrator == "nvt":
+                lmp.fix(f"Ensemble all nvt temp {T} {T} {Tdamp}")
+            elif integrator == "langevin":
+                lmp.fix(f"Ensemble all langevin {T} {T} {Tdamp} {seed}")
+                lmp.fix("NVE all nve")
+            elif integrator == "brownian":
+                lmp.fix(f"Ensemble all brownian {T} {seed} gamma_t {1/Tdamp}")
+            elif integrator == "nve":
+                lmp.fix("Ensemble all nve")
         else:
             Pramp = f"{P} {P} {Pdamp}"
             npt_mode = {
@@ -184,10 +193,15 @@ class MD:
             n_dof = dimension * (n_atoms - 1)
             extra_dof = 3 * n_atoms - n_dof
             lmp.compute_modify(f"thermo_temp extra/dof {extra_dof}")
-        lmp.fix_modify("Ensemble temp thermo_temp")
+            lmp.fix_modify("Ensemble temp thermo_temp")
 
         # Initial velocities and optional constraints for dimensions:
-        lmp.velocity(f"all create {T} {seed} dist gaussian")
+        lmp.velocity(f"all create {T} {seed} dist gaussian") # NORMAL
+        #lmp.velocity("all set 0.0 0.0 0.0") # BROWNIAN
+        #lmp.compute("init_temp all temp")   # 1 atom
+        #lmp.compute_modify("init_temp extra/dof 0") # 1 atom
+        #lmp.velocity(f"all create {T} {seed} dist gaussian mom no temp init_temp") # 1 atom
+        #lmp.uncompute("init_temp")  # 1 atom
         if dimension < 3:
             mask = "0.0 0.0 NULL" if (dimension == 1) else "NULL NULL 0.0"
             lmp.velocity(f"all set {mask}")
