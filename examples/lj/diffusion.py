@@ -95,7 +95,7 @@ def analyze_visc_gk(filepath, T, V, dt):
     try:
         with open(filepath, 'r') as f:
             lines = f.readlines()
-            
+
         # Find the start of the LAST data block
         # LAMMPS block headers contain exactly 2 numbers (Timestep and N-rows)
         block_start = -1
@@ -103,27 +103,28 @@ def analyze_visc_gk(filepath, T, V, dt):
             if len(lines[i].split()) == 2 and not lines[i].startswith('#'):
                 block_start = i
                 break
-                
+
         if block_start == -1:
             print(f"Error: Could not find valid data blocks in {filepath}")
-            return
-            
+            return None, None, None
+
         # Extract just the data lines from the final block
         num_rows = int(lines[block_start].split()[1])
         data_lines = lines[block_start + 1 : block_start + 1 + num_rows]
         data = np.array([list(map(float, line.split())) for line in data_lines])
-        
+
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
-        return
+        return None, None, None
 
+    '''
     # Column 1 is TimeDelta (in steps), Columns 3, 4, 5 are the Pxy, Pxz, Pyz auto-correlations
     time_steps = data[:, 0]
     time_actual = time_steps * dt
     
-    pxy_corr = data[:, 2]
-    pxz_corr = data[:, 3]
-    pyz_corr = data[:, 4]
+    pxy_corr = data[:, 3]
+    pxz_corr = data[:, 4]
+    pyz_corr = data[:, 5]
     
     # Average the three independent shear directions to reduce noise
     avg_corr = (pxy_corr + pxz_corr + pyz_corr) / 3.0
@@ -131,11 +132,25 @@ def analyze_visc_gk(filepath, T, V, dt):
     # Calculate the running integral (cumulative trapezoidal rule)
     running_integral = np.zeros_like(avg_corr)
     running_integral[1:] = np.cumsum((avg_corr[:-1] + avg_corr[1:]) / 2.0 * np.diff(time_actual))
-    
+    '''
+    # Column 0: Index, Column 1: TimeDelta (in steps), Column 2: Count, Columns 3, 4, 5: Correlations
+    time_steps = data[:, 1]
+    time_actual = time_steps * dt
+
+    pxy_corr = data[:, 3]
+    pxz_corr = data[:, 4]
+    pyz_corr = data[:, 5]
+    avg_corr = (pxy_corr + pxz_corr + pyz_corr) / 3.0
+
+    # Running integral
+    running_integral = np.zeros_like(avg_corr)
+    running_integral[1:] = np.cumsum(0.5 * (avg_corr[:-1] + avg_corr[1:]) * np.diff(time_actual))
+
     # Calculate running viscosity (in LJ units, k_B = 1)
     k_B = 1.0
     running_viscosity = (V / (k_B * T)) * running_integral
-    final_viscosity = running_viscosity[-1]
+
+    final_viscosity = np.mean(running_viscosity[- int(len(running_viscosity)*0.2)-1:])
     
     print(f"--- Green-Kubo Viscosity Analysis ---")
     print(f"Temperature: {T} | Volume: {V}")
@@ -175,10 +190,21 @@ def analyze_visc_gk(filepath, T, V, dt):
     plt.close(fig)
     print(f"Saved viscosity plot to: {save_path}\n")
 
+    return final_viscosity, running_viscosity, time_actual
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--filename", type=str, default="results/lj_blank/msd_text.txt")
+    parser.add_argument("--type", type=str, default='mse')
     parser.add_argument("--T", type=float, default=2)
     parser.add_argument("--gamma", type=float, default=2)
+    parser.add_argument("--dt", type=float, default=1e-4)
+    parser.add_argument("--V", type=float, default=1000)
     args = parser.parse_args()
-    analyze_msd(args.filename, args.T, args.gamma)
+    match args.type:
+        case "vacf":
+            analyze_vacf(args.filename, args.T, args.gamma, args.dt)
+        case "visc":
+            analyze_visc_gk(args.filename, args.T, args.V, args.dt)
+        case _:
+            analyze_msd(args.filename, args.T, args.gamma, args.dt)

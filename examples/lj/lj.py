@@ -1,6 +1,7 @@
 """Single-site LJ fluid test with roughly the density of water at STP."""
 import mdext
 import numpy as np
+import matplotlib.pyplot as plt
 import argparse
 import json
 from datetime import datetime
@@ -36,6 +37,17 @@ def main(args) -> None:
     equilibration_steps = args["equilibration_steps"] # equilibration cycles
     collection_steps = args["collection_steps"] # collection cycles
     Tdamp = args["Tdamp"]
+    h5_file = args.get("h5_file")
+
+    # Determine which potential to use for the active collection phase
+    if h5_file and os.path.exists(h5_file):
+        log.info(f"Using InterpolatedPotential from {h5_file}")
+        active_potential = mdext.potential.InterpolatedPotential(h5_file)
+    else:
+        log.info(f"Using Gaussian potential (U0={U0}, sigma={sigma}, mu={mu})")
+        active_potential = mdext.potential.Gaussian(U0, sigma, mu)
+
+    zero_potential = mdext.potential.Gaussian(0, mu, sigma)
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     current_day = datetime.now().strftime("%Y-%m-%d")
@@ -68,7 +80,7 @@ def main(args) -> None:
                 T=T,
                 P=P,
                 seed=i+1,
-                potential=mdext.potential.Gaussian(0, mu, sigma),
+                potential=zero_potential,
                 geometry_type=mdext.geometry.Planar,
                 n_atom_types=1,
                 potential_type=1,
@@ -83,12 +95,104 @@ def main(args) -> None:
             os.makedirs(f"{results_path}/trials/{i}", exist_ok=True)
             md.run(equilibration_steps, "equilibration", f"{results_path}/trials/{i}/equilibration")
             md.reset_stats()
-            md.reset_vext(mdext.potential.Gaussian(U0, sigma, mu))
+            md.reset_vext(active_potential)
             md.run(collection_steps, "collection", f"{results_path}/trials/{i}/collection")
             plot(f"{results_path}/trials/{i}")
         
         avg_results_parallel(results_path, args["trials"], collection_steps)
         plot_movie(f"{results_path}/avg_{args["trials"]}")
+    elif args["run_type"] == "visc_gk":
+        # Multiple independent replicas (different seed each time, same per-replica
+        # equilibration + NVE-swap + Green-Kubo sampling pattern as the single-run path
+        # that used to live here) to get an honest mean +/- stderr instead of one run's
+        # naive "mean of the final 20%" plateau with no uncertainty quantification -
+        # see reference_mdext_ddft.md for why this was flagged as the real gap in the
+        # methodology (NVE-after-Langevin itself is confirmed correct per LAMMPS's own
+        # Green-Kubo example and the literature, so that part is unchanged).
+        n_replicas = args["N_replicas"]
+        s, p, d = 2, 5000, 10000  # unchanged from the original single-run sampling/correlation/dump params
+        replica_etas = []
+        replica_curves = []  # (time_actual, running_viscosity) per valid replica, for the combined plot
+        for rep in range(n_replicas):
+            replica_path = f"{results_path}/replicas/{rep:02d}"
+            os.makedirs(replica_path, exist_ok=True)
+            md = mdext.md.MD(
+                setup=setup,
+                integrator=args["integrator"],
+                T=T,
+                P=P,
+                seed=rep + 1,
+                potential=zero_potential,
+                geometry_type=mdext.geometry.Planar,
+                n_atom_types=1,
+                potential_type=1,
+                steps_per_thermo=10,
+                thermo_per_cycle=1,
+                units="lj",
+                timestep=args["dt"],
+                dr=args["dr"],
+                Tdamp=Tdamp,
+            )
+            md.run(args["equilibration_steps"], "equilibration")
+            md.lmp.command("reset_timestep 0")
+            # Disable thermostat und use NVE
+            md.lmp.command("unfix Ensemble")
+            md.lmp.command("fix NVE all nve")
+
+            # Force evaluation of pressure tensor components:
+            md.lmp.command("compute myTemp all temp")
+            md.lmp.command("compute myPress all pressure myTemp")
+            md.lmp.command("variable pxy equal c_myPress[4]")
+            md.lmp.command("variable pxz equal c_myPress[5]")
+            md.lmp.command("variable pyz equal c_myPress[6]")
+
+            # Run the autocorrelation over NVE trajectory
+            md.lmp.command(
+                f"fix GK_visc all ave/correlate {s} {p} {d} v_pxy v_pxz v_pyz "
+                f"type auto file {replica_path}/visc_data.txt ave running"
+            )
+            md.run(args["diffusion_steps"], "viscosity_test")
+
+            # Analyze results using actual simulation box volume
+            boxlo, boxhi = md.lps.extract_box()[:2]
+            volume = float(np.prod(np.array(boxhi) - np.array(boxlo)))
+            final_viscosity, running_viscosity, time_actual = analyze_visc_gk(
+                f"{replica_path}/visc_data.txt", T, volume, args["dt"]
+            )
+            if final_viscosity is None:
+                print(f"[replica {rep+1}/{n_replicas}] FAILED (no valid data block) - skipping")
+                continue
+            print(f"[replica {rep+1}/{n_replicas}] eta = {final_viscosity:.4f}")
+            replica_etas.append(final_viscosity)
+            replica_curves.append((time_actual, running_viscosity))
+
+        replica_etas = np.array(replica_etas)
+        mean_eta = float(np.mean(replica_etas))
+        stderr_eta = float(np.std(replica_etas, ddof=1) / np.sqrt(len(replica_etas))) if len(replica_etas) > 1 else float("nan")
+        print(f"--- Green-Kubo Viscosity, {len(replica_etas)}/{n_replicas} valid replicas ---")
+        print(f"eta = {mean_eta:.4f} +/- {stderr_eta:.4f} (stderr)")
+
+        with open(f"{results_path}/visc_gk_summary.json", "w") as f:
+            json.dump({
+                "n_replicas_requested": n_replicas,
+                "n_replicas_valid": len(replica_etas),
+                "per_replica_eta": replica_etas.tolist(),
+                "mean_eta": mean_eta,
+                "stderr_eta": stderr_eta,
+            }, f, indent=4)
+
+        plt.figure(figsize=(8, 5))
+        for time_actual, running_viscosity in replica_curves:
+            plt.plot(time_actual, running_viscosity, alpha=0.4)
+        plt.axhline(mean_eta, color="red", lw=2, ls="--", label=f"mean = {mean_eta:.4f} +/- {stderr_eta:.4f}")
+        plt.axhspan(mean_eta - stderr_eta, mean_eta + stderr_eta, color="red", alpha=0.15)
+        plt.xlabel("Time")
+        plt.ylabel("Running Viscosity ($\\eta$)")
+        plt.title(f"Green-Kubo Viscosity, {len(replica_etas)} replicas")
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(f"{results_path}/visc_gk_combined.png", dpi=300, bbox_inches="tight")
+        plt.close()
     else:
         # Run Diffusion Measures for DDFT-gamma calculation
         md = mdext.md.MD(
@@ -97,7 +201,7 @@ def main(args) -> None:
                 T=T,
                 P=P,
                 seed=1,
-                potential=mdext.potential.Gaussian(0, mu, sigma),
+                potential=zero_potential,
                 geometry_type=mdext.geometry.Planar,
                 n_atom_types=1,
                 potential_type=1,
@@ -129,47 +233,9 @@ def main(args) -> None:
             # Diffusion run
             md.run(args["diffusion_steps"], "diffusion_test")
             analyze_vacf(f"{results_path}/vacf_data.txt", T, 1/Tdamp, args["dt"])
-        elif args["run_type"] == "visc_gk":
-            # Green-Kubo parameters
-            s = 5  # sample interval (every 5 steps)
-            p = args["diffusion_steps"] // 10  # correlation length
-            if p == 0: p = 1
-            d = s * p  # dump interval
-            
-            s=1
-            d=1000
-            p=1000
-            md.lmp.command("thermo 1")
-            
-            # Use LAMMPS native global pressure tensor components directly!
-            md.lmp.command("variable pxy equal pxy")
-            md.lmp.command("variable pxz equal pxz")
-            md.lmp.command("variable pyz equal pyz")
-            
-            # Run the autocorrelation
-            # 'ave running' averages the correlation windows over the entire run
-            md.lmp.command(f"fix GK_visc all ave/correlate {s} {p} {d} v_pxy v_pxz v_pyz type auto file {results_path}/visc_data.txt ave running")
+        # "visc_gk" is handled above (multi-replica path, before this single-MD-object branch).
 
-            # Create a dedicated compute to force tensor evaluation every 's' steps
-            #md.lmp.command("compute myTemp all temp")
-            #md.lmp.command("compute pTG all pressure myTemp")
-            
-            # Extract components (4=pxy, 5=pxz, 6=pyz)
-            #md.lmp.command("variable vpxy equal c_pTG[4]")
-            #md.lmp.command("variable vpxz equal c_pTG[5]")
-            #md.lmp.command("variable vpyz equal c_pTG[6]")
-            
-            # Run the autocorrelation using our forced variables
-            #md.lmp.command(f"fix GK_visc all ave/correlate {s} {p} {d} v_vpxy v_vpxz v_vpyz type auto file {results_path}/visc_data.txt ave running")
-            
-            # Run the simulation
-            md.run(args["diffusion_steps"], "viscosity_test")
-            
-            # Analyze results (Assuming V = 10*10*10 = 1000 based on your setup)
-            volume = 10.0 * 10.0 * 10.0
-            analyze_visc_gk(f"{results_path}/visc_data.txt", T, volume, args["dt"])
 
-    
 
 
 def setup(lmp: PyLammps, seed: int) -> int:
@@ -207,6 +273,7 @@ if __name__ == "__main__":
         "collection_steps": (int, 400),
         "run_type": (str, "collection"), # one of [collection, msd, vacf, visc_gk]
         "diffusion_steps": (int, 5000),
+        "N_replicas": (int, 16), # visc_gk only: independent seeded replicas for mean +/- stderr
         "dt": (float, 0.001),
         "Tdamp": (float, 100.0),
         "dr": (float, 1/32),
@@ -215,6 +282,7 @@ if __name__ == "__main__":
         "U0": (float, 5.0),
         "mu": (float, 5.0),
         "sigma": (float, 2.0),
+        "h5_file": (str, None), # Target HDF5 file containing external potential
     }
 
     parser = argparse.ArgumentParser()
