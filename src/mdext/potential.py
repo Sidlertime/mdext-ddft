@@ -40,6 +40,40 @@ class Exponential:
         return E, r_sq_grad
 
 
+class InterpolatedPotential:
+    """External potential loaded and interpolated directly from an HDF5 file."""
+    def __init__(self, h5_filepath: str) -> None:
+        import h5py
+        with h5py.File(h5_filepath, 'r') as f:
+            # Extract domain and potential (flattened to 1D)
+            self.r_data = np.array(f['r']).flatten()
+            self.V_data = np.array(f.get('V', f.get('V_ext'))).flatten()
+            
+        # Ensure coordinates are sorted for numpy interpolation
+        sort_idx = np.argsort(self.r_data)
+        self.r_data = self.r_data[sort_idx]
+        self.V_data = self.V_data[sort_idx]
+        
+        # Calculate gradients using central differences (periodic boundaries)
+        self.grad_data = np.zeros_like(self.V_data)
+        dr = self.r_data[1] - self.r_data[0]
+        self.grad_data[1:-1] = (self.V_data[2:] - self.V_data[:-2]) / (2 * dr)
+        self.grad_data[0] = (self.V_data[1] - self.V_data[-1]) / (2 * dr)
+        self.grad_data[-1] = (self.V_data[0] - self.V_data[-2]) / (2 * dr)
+        
+        self.L = 10.0  # Periodic box length
+
+    def __call__(self, r: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Wrap particle positions into the [0, 10] domain
+        r_wrapped = r % self.L
+        
+        # Linearly interpolate potential and gradient
+        V_interp = np.interp(r_wrapped, self.r_data, self.V_data)
+        grad_interp = np.interp(r_wrapped, self.r_data, self.grad_data)
+        
+        return V_interp, grad_interp
+
+
 class ForceCallback:
     """Force callback object to apply external forces and collect densities."""
 
