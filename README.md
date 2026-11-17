@@ -16,8 +16,21 @@ superadiabatic force). Changes compared to upstream:
 
 ## Installation
 
-The three project repositories share one conda environment and are expected next to each
-other:
+**Platforms:** Linux and macOS. LAMMPS is not available for Windows on conda-forge; on
+Windows, use WSL2.
+
+The repository works on its own. `environment.yml` installs LAMMPS (with its Python module),
+mpi4py and the other dependencies from conda-forge, and installs this package in editable
+mode:
+
+```bash
+git clone https://github.com/Sidlertime/mdext-ddft.git
+cd mdext-ddft
+mamba env create -f environment.yml      # or: conda env create -f environment.yml
+mamba activate mdext-ddft
+```
+
+Together with the other two project repositories, clone all three next to each other:
 
 ```
 workspace/
@@ -26,19 +39,10 @@ workspace/
 └── mdext-ddft/        git clone https://github.com/Sidlertime/mdext-ddft.git
 ```
 
-Create the environment from neural-ddft-pcm. It includes LAMMPS with its Python module
-from conda-forge. Then install this package in editable mode:
-
-```bash
-cd neural-ddft-pcm
-mamba env create -f environment.yml      # or: conda env create -f environment.yml
-mamba activate neural-ddft
-cd ../mdext-ddft
-pip install -e .
-```
-
-If you use mdext-ddft on its own, any environment works that has `lammps` (with the Python
-module), `mpi4py`, `numpy`, `h5py` and `pyyaml`.
+On Linux you can also add LAMMPS to the `neural-ddft` environment of neural-ddft-pcm instead
+of using a second environment:
+`mamba install -n neural-ddft -c conda-forge lammps=2024.08.29 mpi4py`, then run
+`pip install -e .` here.
 
 ### Quick test
 
@@ -64,13 +68,27 @@ step is 0.001τ. Every saved frame is one collection cycle of 10 MD steps (0.01�
 ### 1. External potentials
 
 ```bash
-python potentials.py          # writes mg1, mg2, s1, s2, s3, gausin1 (.h5)
-python potentials.py --list   # prints all names and value ranges
+python potentials.py              # writes mg1, mg2, s1, s2, s3, gausin1 (.h5)
+python potentials.py --reference  # downloads 3a-3d from Zenodo, writes 3a.h5-3d.h5
+python potentials.py --list       # prints all names and value ranges
 ```
 
-- `gaussian` is built into `lj.py` (U0 = 5, μ = 5, σ = 2) and needs no file.
-- `3a`–`3d` are the tabulated potentials of Ram et al. (2025); place their `3a.h5`–`3d.h5`
-  files in `examples/lj/`.
+- `gaussian` is built into `lj.py` (U0 = 5, μ = 5, σ = 2) and needs no file. It is wider
+  than the Gaussian of Ram et al. (2025), which has σ = 1.
+- `3a`–`3d` are the reference potentials of
+  [Ram et al. (2025)](https://doi.org/10.1103/22fd-ykkb) (Fig. 3a–d). They are not
+  analytic, but are stored in every frame of the authors' Brownian dynamics data on
+  [Zenodo](https://doi.org/10.5281/zenodo.17116150) (CC BY 4.0):
+
+  | Potential | Zenodo archive |
+  |---|---|
+  | 3a | `bd-g28-closed-dz100.zip` |
+  | 3b | `bd-g3-closed-dz100.zip` |
+  | 3c | `bd-g4-closed-dz100.zip` |
+  | 3d | `bd-g14-closed-dz100.zip` |
+
+  `python potentials.py --reference` downloads the four archives (about 8 MB each) and writes
+  `3a.h5`–`3d.h5` from the stored `r` and `V`. Add `--cache_dir <folder>` to keep the archives.
 
 | Name | Definition V(z), with g(μ,s) = exp(−(z−μ)²/2s²) and L = 10 |
 |---|---|
